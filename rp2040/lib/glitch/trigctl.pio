@@ -1,0 +1,119 @@
+
+.program trigctl
+
+; autopull should be on, depth 32
+;
+; input pin 0: trigger input
+;
+; set pin 0: glitch output
+;
+; irq 0 rel: PIO->CM0 "has glitched" signal
+; irq 1 rel: CM0->PIO "do a glitch now" signal
+
+public _start:
+	out x, 32 ; offset
+	out y, 32 ; length
+
+	irq clear 0 rel
+
+	mov isr, x
+public waitinsn:
+	wait 0 pin 0 ; or "wait irq 1 rel"
+
+offloop:
+	jmp x-- offloop
+
+	set pins, 1
+
+lenloop:
+	jmp y-- lenloop
+
+	set pins, 0
+
+	irq set 0 rel
+
+	;set x, 15
+	mov x, isr
+offloop2:
+	jmp x-- offloop2 ;[15]
+public wait2:
+	wait 1 pin 0 ; or "nop"
+
+% c-sdk {
+
+enum trigctl_source {
+	trig_source_pin,
+	trig_source_irq
+};
+
+static inline void trigctl_pio_init(PIO pio, uint sm, uint prog_offs,
+		enum trigctl_source trigsrc, uint glitch_pin, uint trig_pin/*,
+		enum glitch_polarity trig_in_pol, enum glitch_polarity glitch_out_pol*/
+		, bool enable) {
+	pio_sm_set_enabled(pio, sm, false);
+
+	if (trigsrc == trig_source_irq) {
+		pio->instr_mem[prog_offs + trigctl_offset_waitinsn] =
+			pio_encode_wait_irq(true, true, 1);
+		pio->instr_mem[prog_offs + trigctl_offset_wait2] =
+			pio_encode_nop();
+	} else {
+		pio->instr_mem[prog_offs + trigctl_offset_waitinsn] =
+			pio_encode_wait_pin(false, 0); // FIXME (currently falling edge)
+		pio->instr_mem[prog_offs + trigctl_offset_wait2] =
+			pio_encode_wait_pin(true, 0); // FIXME (currently falling edge)
+	}
+
+	pio_sm_config c = trigctl_program_get_default_config(prog_offs);
+	sm_config_set_set_pins(&c, glitch_pin, 1);
+	sm_config_set_in_pins(&c, trig_pin/*, 1*/);
+	sm_config_set_out_shift(&c, false, true, 32);
+	sm_config_set_in_shift(&c, false, true, 32);
+	sm_config_set_clkdiv(&c, 1);
+
+	if (trigsrc == trig_source_irq) {
+		sm_config_set_wrap(&c, prog_offs + trigctl_wrap_target,
+				prog_offs + trigctl_wrap - 1);
+	}
+
+	pio_sm_init(pio, sm, prog_offs, &c);
+
+	pio_sm_set_consecutive_pindirs(pio, sm, glitch_pin, 1, true );
+	pio_sm_set_consecutive_pindirs(pio, sm, trig_pin  , 1, false);
+	pio_sm_set_pins_with_mask(pio, sm, 0, 1u << glitch_pin);
+
+	pio_sm_set_enabled(pio, sm, enable);
+	pio_gpio_init(pio, glitch_pin);
+	pio_gpio_init(pio, trig_pin);
+}
+
+// ony use "use_wfi" when the corresponding IRQ is enabled in the NVIC
+/*static inline void trigctl_wait_glitch_irq(PIO pio, uint sm, bool use_wfi) {
+	uint mask = 1u << ((sm + 0) & 3);
+	if (use_wfi) {
+		while (!(pio->irq & mask)) __WFE();
+	} else {
+		while (!(pio->irq & mask)) ;
+	}
+}*/
+static inline void trigctl_ack_glitch_irq(PIO pio, uint sm) {
+	hw_set_bits(&pio->irq, 1 << ((sm + 0) & 3));
+}
+// nvic_irqno: corresponding NVIC IRQ will be PIO${pio}_IRQ_${nvic_irqno}
+static inline void trigctl_set_glitch_irq_enabled(PIO pio, uint sm, uint nvic_irqno, bool en) {
+	pio_set_irqn_source_enabled(pio, nvic_irqno, PIO_INTR_SM0_LSB + ((sm + 0) & 3), en);
+}
+
+/*static inline void trigctl_send_trig_irq(PIO pio, uint sm) {
+	pio->irq_force = 1 << ((sm + 1) & 3);
+}*/
+
+static inline void trigctl_push_off_len(PIO pio, uint sm, uint32_t off, uint32_t len) {
+	while (pio_sm_is_tx_fifo_full(pio, sm)) ;
+	pio->txf[sm] = off;
+	while (pio_sm_is_tx_fifo_full(pio, sm)) ;
+	pio->txf[sm] = len;
+}
+
+%}
+

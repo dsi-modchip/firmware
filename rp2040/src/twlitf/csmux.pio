@@ -1,0 +1,31 @@
+
+.program csmux
+
+public _start:
+	mov pins, pins
+
+% c-sdk {
+
+static inline void csmux_pio_init(PIO pio, uint sm, uint prog_offs,
+		int pin_in, /*int pin_out,*/ bool enable) {
+	pio_sm_set_enabled(pio, sm, false);
+
+	pio_sm_config c = csmux_program_get_default_config(prog_offs);
+	sm_config_set_in_pins(&c, pin_in);
+	//if (pin_out >= 0) sm_config_set_out_pins(&c, pin_out, 1);
+	sm_config_set_clkdiv(&c, 1);
+
+	pio_sm_init(pio, sm, prog_offs, &c);
+
+	pio_sm_set_consecutive_pindirs(pio, sm, pin_in, 1, false);
+	//pio_sm_set_consecutive_pindirs(pio, sm, pin_out, 1, true);
+
+	pio_sm_set_enabled(pio, sm, enable);
+
+	// pio_gpio_init() is the same as setting the gpio func to pio
+	pio_gpio_init(pio, pin_in );
+	//pio_gpio_init(pio, pin_out);
+}
+
+%}
+

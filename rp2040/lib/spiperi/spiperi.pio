@@ -1,0 +1,148 @@
+
+; autopull off, set fifo depth depending on data size
+;
+; input pin 0: copi
+; wait pin 1: sclk
+; wait pin 2: ncs
+; output/set pin 0: cipo ; UNUSED
+
+.program spiperi
+.side_set 1
+
+public _start:
+waitncs:
+	jmp pin waitncs side 1 [10] ; wait for nCS to be low
+
+public bitset:
+	set x, 7 side 0 ; databits - 1
+dataloop:
+	; wait for sampling clock edge
+public clkedge_lead:
+	wait 0 gpio 1 side 0
+	jmp pin waitncs side 1 [5]
+	in pins, 1 side 0 ; shift in data
+
+	; wait for output clock edge
+public clkedge_foll:
+	wait 1 gpio 1 side 0
+	jmp pin waitncs side 1 [5]
+	nop side 0;out pins, 1 ; output data
+
+	; next data bit
+	jmp x-- dataloop side 0
+public _end:
+
+% c-sdk {
+
+/*#define SPIPERI_SIDE_PIN 8*/
+
+static inline void spiperi_pio_init(PIO pio, uint sm, uint off,
+		uint bits, spi_cpol_t cpol, spi_cpha_t cpha, spi_order_t order,
+		int sclk, int copi, int cipo, int ncs, bool enable) {
+	(void)order; (void)cipo;
+
+	pio_sm_set_enabled(pio, sm, false);
+
+#ifdef SPIPERI_SIDE_PIN
+	const uint32_t sideset_0 = pio_encode_sideset(1, 0);
+	const uint32_t sideset_1 = pio_encode_sideset(1, 1);
+#else
+	const uint32_t sideset_0 = 0, sideset_1 = 0;
+#endif
+
+	uint entry/*, wrapend = spiperi_offset__end - 1*/;
+	pio_sm_config c = spiperi_program_get_default_config(off);
+
+	// set data bits
+	pio->instr_mem[off + spiperi_offset_bitset] = pio_encode_set(pio_x, bits - 1) | sideset_1 | pio_encode_delay(15);
+
+	if (ncs >= 0) {
+		entry = spiperi_offset__start;
+	} else {
+		entry = spiperi_offset_bitset;
+	}
+	// if no cipo: nop out output insn, set wrap end to before outflush
+	uint outinsn = sideset_0;
+	/*if (cipo >= 0) {
+		outinsn |= pio_encode_out(pio_pins, 1);
+	} else*/ {
+		outinsn |= pio_encode_nop();
+	}
+	// if CPHA=1: lead=out, foll=smp ; if CPOL=0: rise=out, fall=smp & vice versa
+	// if CPHA=0: lead=smp, foll=out ; if CPOL=0: rise=smp, fall=out & vice versa
+	uint smpinsn = pio_encode_in(pio_pins, 1) | sideset_0;//1 | pio_encode_delay(5);
+	uint wloinsn = pio_encode_wait_gpio(false, sclk) | sideset_0;
+	uint whiinsn = pio_encode_wait_gpio(true , sclk) | sideset_0;
+	if (cpha == SPI_CPHA_1) {
+		if (cpol == SPI_CPOL_0) {
+			pio->instr_mem[off + spiperi_offset_clkedge_lead + 0] = whiinsn;
+			pio->instr_mem[off + spiperi_offset_clkedge_lead + 2] = outinsn;
+			pio->instr_mem[off + spiperi_offset_clkedge_foll + 0] = wloinsn;
+			pio->instr_mem[off + spiperi_offset_clkedge_foll + 2] = smpinsn;
+		} else {
+			pio->instr_mem[off + spiperi_offset_clkedge_lead + 0] = wloinsn;
+			pio->instr_mem[off + spiperi_offset_clkedge_lead + 2] = outinsn;
+			pio->instr_mem[off + spiperi_offset_clkedge_foll + 0] = whiinsn;
+			pio->instr_mem[off + spiperi_offset_clkedge_foll + 2] = smpinsn;
+		}
+	} else {
+		if (cpol == SPI_CPOL_0) {
+			pio->instr_mem[off + spiperi_offset_clkedge_lead + 0] = whiinsn;
+			pio->instr_mem[off + spiperi_offset_clkedge_lead + 2] = smpinsn;
+			pio->instr_mem[off + spiperi_offset_clkedge_foll + 0] = wloinsn;
+			pio->instr_mem[off + spiperi_offset_clkedge_foll + 2] = outinsn;
+		} else {
+			pio->instr_mem[off + spiperi_offset_clkedge_lead + 0] = wloinsn;
+			pio->instr_mem[off + spiperi_offset_clkedge_lead + 2] = smpinsn;
+			pio->instr_mem[off + spiperi_offset_clkedge_foll + 0] = whiinsn;
+			pio->instr_mem[off + spiperi_offset_clkedge_foll + 2] = outinsn;
+		}
+	}
+
+	//sm_config_set_wrap(&c, entry, wrapend);
+	sm_config_set_in_shift(&c, false, true, bits);
+	//sm_config_set_out_shift(&c, false, true, bits);
+	sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX/*NONE*/);
+	sm_config_set_in_pins(&c, copi);
+	if (ncs >= 0) sm_config_set_jmp_pin(&c, ncs);
+	//if (cipo >= 0) sm_config_set_out_pins(&c, cipo, 1);
+	sm_config_set_clkdiv(&c, 1);
+#ifdef SPIPERI_SIDE_PIN
+	sm_config_set_sideset_pins(&c, SPIPERI_SIDE_PIN);
+#endif
+
+	pio_sm_init(pio, sm, off + entry, &c);
+
+	pio_sm_set_consecutive_pindirs(pio, sm, sclk, 1, false);
+	pio_sm_set_consecutive_pindirs(pio, sm, copi, 1, false);
+	//if (cipo >= 0) pio_sm_set_pindirs_with_mask(pio, sm, (1u<<cipo), (1u<<cipo));
+	if (ncs  >= 0) pio_sm_set_consecutive_pindirs(pio, sm, ncs, 1, false);
+
+	pio_gpio_init(pio, copi);
+	pio_gpio_init(pio, sclk);
+	//if (cipo >= 0) pio_gpio_init(pio, cipo);
+	if (ncs  >= 0) pio_gpio_init(pio, ncs );
+
+#ifdef SPIPERI_SIDE_PIN
+	/*gpio_set_drive_strength(SPIPERI_SIDE_PIN, GPIO_DRIVE_STRENGTH_12MA);
+	gpio_set_slew_rate(SPIPERI_SIDE_PIN, GPIO_SLEW_RATE_FAST);*/
+	pio_gpio_init(pio, SPIPERI_SIDE_PIN);
+	pio_sm_set_consecutive_pindirs(pio, sm, SPIPERI_SIDE_PIN, 1, true);
+	/*gpio_put(SPIPERI_SIDE_PIN, false);
+	gpio_set_dir(SPIPERI_SIDE_PIN, GPIO_OUT);
+	gpio_set_function(SPIPERI_SIDE_PIN, GPIO_FUNC_NULL);
+	gpio_pull_down(SPIPERI_SIDE_PIN);*/
+#endif
+
+	pio_sm_set_enabled(pio, sm, enable);
+}
+
+static inline void spiperi_ack_irq(PIO pio, uint sm) {
+	hw_set_bits(&pio->irq, 1 << (((sm + 0) & 3) + PIO_INTR_SM0_RXNEMPTY_LSB));
+}
+static inline void spiperi_set_irq_enabled(PIO pio, uint sm, uint nvic_irqno, bool en) {
+	pio_set_irqn_source_enabled(pio, nvic_irqno, PIO_INTR_SM0_RXNEMPTY_LSB + ((sm + 0) & 3), en);
+}
+
+%}
+

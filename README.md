@@ -1,4 +1,4 @@
-#·dsi-modchip firmware
+# dsi-modchip firmware
 
 Firmware for the DSi bootrom glitcher PCB (RP2040)
 
